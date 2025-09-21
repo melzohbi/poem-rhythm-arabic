@@ -95,6 +95,7 @@ class AbstractPoetryLMTrainer(Trainer, ABC):
         model,
         tokenizer,
         eval_multiplier,
+        num_train_epochs,
         output_dir,
         # https://github.com/huggingface/transformers/issues/14608#issuecomment-1004390803
         fp16=False,
@@ -132,9 +133,9 @@ class AbstractPoetryLMTrainer(Trainer, ABC):
             optim="adamw_torch",
             lr_scheduler_type="cosine",
             learning_rate=LM_LEARNING_RATES[learning_rate],
-            num_train_epochs=1 if test_run else 4,
-            weight_decay=0.1,
-            warmup_ratio=0.01,
+            num_train_epochs=1 if test_run else num_train_epochs,
+            weight_decay=0.01,
+            warmup_ratio=0.1,
             # eval_multiplier=eval_multiplier,
             global_train_batch_size=batch_size,
             global_eval_batch_size=batch_size,
@@ -146,12 +147,16 @@ class AbstractPoetryLMTrainer(Trainer, ABC):
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
             ddp_find_unused_parameters=False,
-            evaluation_strategy="epoch",
+            evaluation_strategy="epoch",  # if test_run else "steps",
+            # evaluation_strategy="steps",
+            # eval_steps=3242,
+            # eval_steps=None if test_run else 7140,
             save_strategy="epoch",
-            logging_steps=20 if test_run else 250,
+            logging_steps=20 if test_run else 100,
             logging_first_step=True,
             output_dir=output_dir,
-            report_to="wandb",
+            # report_to="wandb", # if you want to use wandb
+            label_names=["labels"],
         )
 
     @abstractmethod
@@ -219,8 +224,7 @@ class AbstractPoetryLMTrainer(Trainer, ABC):
         ds = self.eval_dataset
         metrics = self.evaluate(eval_dataset=ds)
 
-        metrics = {key.replace("eval", "test")
-                               : value for key, value in metrics.items()}
+        metrics = {key.replace("eval", "test")                   : value for key, value in metrics.items()}
         self.log_metrics('test', metrics)
         if save_metrics:
             self.save_metrics('test', metrics, False)

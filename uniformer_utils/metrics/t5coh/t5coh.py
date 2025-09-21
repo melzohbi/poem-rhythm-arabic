@@ -6,22 +6,22 @@ import torch
 from datasets import Features, Value
 from datasets.info import MetricInfo
 import datasets.metric
-from transformers.models.t5.modeling_t5 import T5ForConditionalGeneration
-from transformers.models.t5.tokenization_t5 import T5Tokenizer
+from transformers import MT5ForConditionalGeneration, AutoTokenizer
+from uniformer_utils.arud import strip_all_tashkeel
 
 
 class T5Coherence(datasets.metric.Metric):
-    """Score coherence in a quatrain using T5 model"""
+    """Score coherence in a quatrain using mT5 model"""
 
     def __init__(
         self,
-        model_name="google-t5/t5-small",
+        model_name="google/mt5-base",
         **kwargs,
     ):
         kwargs["config_name"] = model_name
         super().__init__(**kwargs)
-        self.model = T5ForConditionalGeneration.from_pretrained(model_name)
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+        self.model = MT5ForConditionalGeneration.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def _info(self):
         return MetricInfo(
@@ -43,6 +43,11 @@ class T5Coherence(datasets.metric.Metric):
             batch_texts = texts[i * batch_size: (i + 1) * batch_size]
             batch_masked_words = masked_words[i *
                                               batch_size: (i + 1) * batch_size]
+
+            # remove taskeel from both texts and masked words to prepare for mt5
+            batch_texts = [strip_all_tashkeel(text) for text in batch_texts]
+            batch_masked_words = [strip_all_tashkeel(
+                text) for text in batch_masked_words]
 
             # Tokenize the batch
             tokenized_texts = self.tokenizer(

@@ -1,12 +1,10 @@
 # This code has been adapted from the GitHub repository 'https://github.com/potamides/uniformers'
 # Portions of the original code have been modified to fit the specific requirements
 # of this project. Credit goes to the original authors for their contributions.
-
 from uniformer_utils.utils import AbstractPoetryLMTrainer
-from uniformer_utils.process_english import QuatrainV2Processing
 from uniformer_utils.metrics import load_metric
 import random
-import wandb
+# import wandb
 from functools import partial
 from random import randrange
 import torch
@@ -16,13 +14,28 @@ from transformers.data.data_collator import (
     DataCollatorForSeq2Seq,
 )
 from transformers.utils import logging
-from transformers import AutoTokenizer, XLMRobertaForSequenceClassification
-from dp.phonemizer import Phonemizer
+from transformers import TrainerCallback
 import numpy as np
-from datasets import load_from_disk
+from datasets import Dataset
 from uniformer_utils.datasets import load_dataset
+from tqdm import tqdm
+
+from uniformer_utils.arud import some_tashkeel, convert_to_phones, convert_to_beat
+import rapidfuzz.distance.Levenshtein as _Levenshtein
+from statistics import mean
 
 logger = logging.get_logger("transformers")
+
+
+class MultiEvalCallback(TrainerCallback):
+    def __init__(self, second_dataset):
+        super().__init__()
+        self.second_dataset = second_dataset
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        trainer = kwargs["trainer"]
+        second_metrics = trainer.evaluate(eval_dataset=self.second_dataset)
+        print("Evaluation on second dataset:", second_metrics)
 
 
 def _add_special_tokens(tokenizer, texts):
@@ -31,7 +44,7 @@ def _add_special_tokens(tokenizer, texts):
 
 
 # sample spans according to a geometric distribution
-def sample_spans(tokens, budget_percentage, p, CorVs):
+def sample_spans(tokens, budget_percentage, p, CorVs, avoid_multi_zeros=False):
     # Total number of tokens
     n = len(tokens)
 
@@ -47,12 +60,29 @@ def sample_spans(tokens, budget_percentage, p, CorVs):
     # Ensure the span length doesn't exceed the remaining budget
     span_length = min(span_length, budget)
 
-    # Randomly select a starting point
-    start_index = random.randint(0, n - 1)
+    if avoid_multi_zeros:
+        found_valid = False
+        for _ in range(100):
+            candidate_start = random.randint(0, n - 1)
+            candidate_end = min(candidate_start + span_length, n)
+            if "00" not in CorVs[candidate_start:candidate_end]:
+                start_index = candidate_start
+                end_index = candidate_end
+                found_valid = True
+                break
+        # If no valid span is found, randomly select a starting point even if it contains zeros
+        if not found_valid:
+            candidate_start = random.randint(0, n - 1)
+            candidate_end = min(candidate_start + span_length, n)
 
-    # Compute the span indices
-    # Ensure span doesn't exceed sequence length
-    end_index = min(start_index + span_length, n)
+    else:
+
+        # Randomly select a starting point
+        start_index = random.randint(0, n - 1)
+
+        # Compute the span indices
+        # Ensure span doesn't exceed sequence length
+        end_index = min(start_index + span_length, n)
 
     # Add the indices to the masked set
     for i in range(start_index, end_index):
@@ -94,11 +124,10 @@ def update_attention_mask(input_ids, attention_mask):
     return attention_mask
 
 
-def _tokenizer_v2(examples, tokenizer, is_encoder_decoder=False, multiple=False, ablation=False):
+def _tokenizer_arabic(examples, tokenizer, is_encoder_decoder=False, multiple=False, ablation=False):
     inputs, labels = list(), list()
 
-    for id, verse in enumerate(examples['clean_lines']):
-
+    for id, verse in enumerate(examples['lines']):
         list_of_words = verse.split(" ")
 
         # select for one word
@@ -106,76 +135,28 @@ def _tokenizer_v2(examples, tokenizer, is_encoder_decoder=False, multiple=False,
             if not multiple:
                 chosen_word = random.choice(list_of_words)
                 index = list_of_words.index(chosen_word)
-                chosen_word_corv = examples['CorVs'][id].split(",")[index]
 
-                list_of_words[index] = f"<extra_id_0>{chosen_word_corv}<extra_id_1>"
-                text_masked = " ".join(list_of_words)
-                chosen_word_text = f"{chosen_word}"
-            else:
-                # select for multiple words
-                budget_percentage = 25
-                p = 0.2
-                result = sample_spans(
-                    list_of_words, budget_percentage, p, examples['CorVs'][id].split(","))
-                text_masked = result["text_masked"]
-                chosen_word_text = result["chosen_words"]
-
-        except:
-            logger.info(
-                f"Error with verse: {verse} and word: {chosen_word_text}")
-            text_masked = "something <extra_id_0>CVCC<extra_id_1> wrong"
-            chosen_word_text = "went"
-
-        inputs.append(text_masked + "<extra_id_2>")
-        labels.append(chosen_word_text)
-
-    if is_encoder_decoder:
-        model_inputs = tokenizer(inputs, add_special_tokens=False)
-
-        # added to update the attention mask for ablation study
-        if ablation:
-            model_inputs["attention_mask"] = update_attention_mask(
-                model_inputs["input_ids"], model_inputs["attention_mask"])
-
-        labels = tokenizer(labels)
-        model_inputs["labels"] = labels["input_ids"]
-        return model_inputs
-    else:
-        return tokenizer(_add_special_tokens(tokenizer, [i + l for i, l in zip(inputs, labels)]))
-
-# this function is similar to the above function, we can combine them into one function
-
-
-def _tokenizer_v2_binary(examples, tokenizer, is_encoder_decoder=False, multiple=False, ablation=False):
-    inputs, labels = list(), list()
-
-    for id, verse in enumerate(examples['clean_lines']):
-        list_of_words = verse.split(" ")
-
-        # select for one word
-        try:
-            if not multiple:
-                chosen_word = random.choice(list_of_words)
-                index = list_of_words.index(chosen_word)
                 chosen_word_corv = examples['binary'][id].split(",")[index]
 
                 list_of_words[index] = f"<extra_id_0>{chosen_word_corv}<extra_id_1>"
-                text_masked = " ".join(list_of_words)
+
+                text_masked = " ".join(some_tashkeel(list_of_words, p=0.2))
                 chosen_word_text = f"{chosen_word}"
             else:
                 # select for multiple words
                 budget_percentage = 25
                 p = 0.2
                 result = sample_spans(
-                    list_of_words, budget_percentage, p, examples['binary'][id].split(","))
-                text_masked = result["text_masked"]
+                    list_of_words, budget_percentage, p, examples['binary'][id].split(","), avoid_multi_zeros=True)
+
+                text_masked = some_tashkeel(result["text_masked"], p=0.2)
                 chosen_word_text = result["chosen_words"]
 
         except:
             logger.info(
                 f"Error with verse: {verse} and word: {chosen_word_text}")
-            text_masked = "something <extra_id_0>100<extra_id_1> wrong"
-            chosen_word_text = "went"
+            text_masked = "هَكَذَا <extra_id_0>1010<extra_id_1> لَهُم"
+            chosen_word_text = "قُلْنَاْ"
 
         inputs.append(text_masked + "<extra_id_2>")
         labels.append(chosen_word_text)
@@ -196,17 +177,16 @@ def _tokenizer_v2_binary(examples, tokenizer, is_encoder_decoder=False, multiple
 
 
 # This is a custom trainer class for our purpose
-class PoetryCVTrainer(AbstractPoetryLMTrainer):
+class PoetryArabicTrainer(AbstractPoetryLMTrainer):
     def __init__(
         self,
         model,
-        lang="en",
         batch_size=128,
         test_run=False,
-        low_resource=False,
-        model_type="binary",
         multiple_words=False,
         ablation=False,
+        train_on='tash',
+        num_train_epochs=3,
         **kwargs,
     ):
 
@@ -215,11 +195,9 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             batch_size=batch_size,
             test_run=test_run,
             eval_multiplier=5 if test_run else 75,
+            num_train_epochs=num_train_epochs,
             **kwargs,
         )
-
-        self.eval_table = wandb.Table(columns=["ex_id", "original word", "corv_original", "predicted word", "masked sentence",
-                                      "corv_score", "lev_score", "t5-prp-fluency"])
 
         if model.config.is_encoder_decoder:
             data_collator = DataCollatorForSeq2Seq(self.tokenizer, self.model)
@@ -230,27 +208,10 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
 
-        # these can be arguments.
-        lang_model = "papluca/xlm-roberta-base-language-detection"
-        phonemizer_checkpoint = 'en_us_cmudict_ipa_forward.pt'
-
-        logger.info(f"Loading language detection model {lang_model}")
-        self.detection_tokenizer = AutoTokenizer.from_pretrained(
-            lang_model)
-        self.detection_model = XLMRobertaForSequenceClassification.from_pretrained(
-            lang_model).to(self.device).eval()
-
-        logger.info(f"Loading phonemizer model {phonemizer_checkpoint}")
-        self.phonemizer = Phonemizer.from_checkpoint(phonemizer_checkpoint)
-
-        train_data, eval_data = self.load_dataset(
-            lang,
-            batch_size,
+        tash_train_data, tash_eval_data, apcd_train_data, apcd_eval_data = self.load_dataset(
             test_run,
-            low_resource,
-            model_type,
             multiple_words,
-            ablation,
+            ablation
         )
 
         super(AbstractPoetryLMTrainer, self).__init__(
@@ -258,30 +219,34 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             tokenizer=self.tokenizer,
             args=self.args,
             data_collator=data_collator,
-            train_dataset=train_data,
-            eval_dataset=eval_data,
+            train_dataset=tash_train_data if train_on == 'tash' else apcd_train_data,
+            eval_dataset={"eval_tash": tash_eval_data,
+                          "eval_poetry": apcd_eval_data},
+            # callbacks=[MultiEvalCallback(eval_data_2)],
             compute_metrics=partial(
                 self.compute_metrics,
-                lang,
                 batch_size,
-                model_type,
             ),
             **self.trainer_args,
         )
 
     def save_state(self):
         super().save_state()
-        if wandb.run:
-            wandb.run.log({"eval_table": self.eval_table})
 
-    def compute_metrics(self, lang, bs, model_type, p):
+    def compute_metrics(self, bs, p):
         labels = p.label_ids[0] if isinstance(
             p.label_ids, tuple) else p.label_ids
         labels = self.decode(
             where(labels == -100, self.tokenizer.pad_token_id, labels), batch=True)
         preds = super().compute_metrics(p)
+
+        # if using wandb
+        # eval_table = wandb.Table(columns=["ex_id", "original word", "corv_original", "predicted word", "masked sentence",
+        #                                   "corv_score", "lev_score", "t5-prp-fluency"])
+
         corv_string_list, preds_, masked_sentences_ = list(), list(), list()
-        for idx, pred in enumerate(preds):
+
+        for idx, pred in tqdm(enumerate(preds)):
             tokenized = self.tokenizer.tokenize(pred)
             # mask_token = self.tokenizer.tokenize(" [MASK] ")
             corv_list = tokenized[tokenized.index(
@@ -300,24 +265,60 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
                 self.tokenizer.convert_tokens_to_string(masked_sentence_).replace("<pad>", ""))
 
         logger.info(
-            f"Computing metrics with the convowel metric and the cohwordorig metrics")
+            f"Computing metrics with the arabic align metric")
 
-        if model_type == "binary":
-            convowel_score = load_metric("convowelencode", batch_size=bs, phonemizer=self.phonemizer).compute(
-                predicted_words=preds, corv=corv_string_list)
+        # convowel_score = load_metric("arabicalign", batch_size=bs, diac_model=self.diac_model).compute(
+        #     predicted_words=preds, corv=corv_string_list)
 
-        else:
-            convowel_score = load_metric("convowel", language=lang, batch_size=bs, phonemizer=self.phonemizer).compute(
-                predicted_words=preds, corv=corv_string_list)
-
-        t5coh_score = load_metric("t5coh", batch_size=bs).compute(
+        # modified with mt5 version to accept arabic text
+        mt5coh_score = load_metric("t5coh", batch_size=bs).compute(
             texts=masked_sentences_, predicted_words=preds_)
 
-        for idx in random.sample(range(len(preds)), 100):
-            self.eval_table.add_data(idx, labels[idx], corv_string_list[idx], preds_[idx], masked_sentences_[idx],
-                                     convowel_score['corv_score'], convowel_score['lev_score'], t5coh_score['t5-prp-fluency'])
+        convowel_score = self.calculate_metric(preds, corv_string_list)
 
-        return convowel_score | t5coh_score
+        # log to wandb if using wandb
+        # for idx in random.sample(range(len(preds)), 100):
+        #     eval_table.add_data(idx, labels[idx].replace("<pad>", ""), corv_string_list[idx], preds_[idx], masked_sentences_[idx],
+        #                         convowel_score['corv_score'], convowel_score['lev_score'], mt5coh_score['t5-prp-fluency'])
+
+        # if wandb.run:
+        #     wandb.run.log({"eval_table": eval_table})
+
+        return convowel_score | mt5coh_score
+
+    def calculate_metric(self, predicted_words, corvs):
+
+        processed_predicted_words = list()
+        scores = list()
+        lev_distances = list()
+
+        for predicted_word, corv in zip(predicted_words, corvs):
+
+            predicted_word = predicted_word.replace("<pad>", "")
+            predicted_word = convert_to_beat(convert_to_phones(predicted_word))
+
+            predicted_word = predicted_word.replace(",", "")
+            corv = corv.replace(" ", "")
+
+            scores.append(float(predicted_word == corv))
+
+            score = _Levenshtein.normalized_similarity(predicted_word, corv)
+
+            lev_distances.append(score)
+
+            processed_predicted_words.append(predicted_word)
+
+        # get a random number between 0 and len(processed_predicted_words)
+        i = random.randint(0, len(processed_predicted_words) - 1)
+        logger.info(
+            f"Sample: predicted word pattern is {processed_predicted_words[i]} and original pattern is {corvs[i]}")
+
+        output_dict = {
+            "corv_score": mean(scores),
+            "lev_score": mean(lev_distances)
+        }
+
+        return output_dict
 
     def patch_tokenizer(self):
         super().patch_tokenizer()
@@ -329,60 +330,56 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             self.tokenizer.add_special_tokens(special)  # pyright: ignore
             self.model.resize_token_embeddings(len(self.tokenizer))
 
-    def classify_language(self, sentence):
-        # Tokenize the input sentence
-        inputs = self.detection_tokenizer(
-            sentence, return_tensors="pt", truncation=True, padding=True, max_length=512).to(self.device)
+    def truncate_text(self, text, length):
+        if len(text) > length:
+            return text[:length] + text[length:].split(' ', 1)[0]
+        return text
 
-        # Predict the language
-        with torch.no_grad():
-            outputs = self.detection_model(**inputs)
-            predictions = torch.argmax(outputs.logits, dim=1)
+    def load_dataset(self, test, multiple_words, ablation):
 
-        # Map the prediction to the language
+        # logger.info(f"Loading the apcd arabic dataset for processing...")
 
-        predicted_languages = [self.detection_model.config.id2label[prediction.item()]
-                               for prediction in predictions]
+        # raw_dataset = load_dataset(
+        #     "csv", data_files="datasets/apcd_dataset.csv")
 
-        return [lang == 'en' for lang in predicted_languages]
+        # raw_dataset = raw_dataset['train']
 
-    def load_dataset(self, lang, bs, test, low_res, model_type, multiple_words, ablation):
+        logger.info(f"Loading the arabic datasets for processing...")
 
-        dataset_class = "quatrainv2"
-        logger.info(f"Loading dataset from class {dataset_class}")
-        raw_dataset = load_dataset(dataset_class, lang=lang, split="train" + (
-            "[:20000]" if test else ""))
+        raw_dataset = load_dataset(
+            "csv", data_files="datasets/tash_train.csv")
+        raw_apcd_dataset = load_dataset(
+            "csv", data_files="datasets/apcd_train.csv")
 
-        # load only english verses
-        logger.info(
-            f"Filtering dataset for english verses with a language model")
-        english_dataset = raw_dataset.filter(
-            lambda x: self.classify_language(x['line']), batched=True)  # slow
+        # combine the two datasets
 
-        logger.info(f"Processing dataset with phonemizer")
-        dataset = english_dataset.map(
-            QuatrainV2Processing(
-                lang=lang,
-                phonemizer=self.phonemizer,
-                batch_size=bs,
-            ),
-            batched=True,
-        )
+        # raw_eval_dataset = load_from_disk("arabic_poetry/arabic_full_diac_Tashkeelah_dataset.hf")
 
-        # save the dataset to disk to save time
-        # dataset.save_to_disk("english_quatrainv_Apr22.hf")
+        raw_dataset['apcd_train'] = raw_apcd_dataset['train']
+        raw_dataset['train'] = raw_dataset['train']
 
-        # load the dataset from disk to save time
-        # dataset = load_from_disk("english_quatrainv_Apr22.hf")
-        # dataset.cleanup_cache_files()
+        # remove untash,phones columns
+        # raw_dataset = raw_dataset.remove_columns(['untash', 'phones'])
 
         if test:
-            dataset = dataset.shuffle(seed=42).select(range(10000))
+            raw_dataset = raw_dataset[:10000]
+            raw_dataset = Dataset.from_dict(raw_dataset)
+
+        # else:
+        #     raw_dataset = raw_dataset.shuffle(seed=42).select(range(2000000))
+
+        # truncate the dataset to 256 only
+        raw_dataset = raw_dataset.map(lambda examples: {
+            'lines': [self.truncate_text(text, 256) for text in examples['lines']]
+        }, batched=True)
+
+        raw_dataset = raw_dataset.filter(
+            lambda example: len(example['lines'].split(" ")) > 4)
 
         # tokenizing the dataset.
-        logger.info(f"Tokenizing dataset with _tokenizer_v2 or binary version")
-        tokenized_dataset = dataset.map(
-            _tokenizer_v2_binary if model_type == "binary" else _tokenizer_v2,
+        logger.info(f"Tokenizing dataset with _tokenizer_arabic")
+        tokenized_dataset = raw_dataset.map(
+            _tokenizer_arabic,
             batched=True,
             fn_kwargs={  # pyright: ignore
                 "tokenizer": self.tokenizer,
@@ -393,15 +390,17 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             load_from_cache_file=False
         )
 
-        if low_res:
-            tokenized_dataset, eval_tokenized_dataset = tokenized_dataset.train_test_split(
-                test_size=(0.001 if not test else 0.5)).values()
-        else:
-            tokenized_dataset, eval_tokenized_dataset = tokenized_dataset.train_test_split(
-                test_size=(0.005 if not test else 0.5)).values()  # pyright: ignore
+        tash_train_tokenized_dataset = tokenized_dataset['train']
+        apcd_train_tokenized_dataset = tokenized_dataset['apcd_train']
+        # test_tokenized_dataset = tokenized_dataset['test']
 
-        index = randrange(len(tokenized_dataset))
-        sample = tokenized_dataset[index]
+        tash_train_tokenized_dataset, tash_eval_tokenized_dataset = tash_train_tokenized_dataset.train_test_split(
+            test_size=3500, seed=42).values()
+        apcd_train_tokenized_dataset, apcd_eval_tokenized_dataset = apcd_train_tokenized_dataset.train_test_split(
+            test_size=3500, seed=42).values()
+
+        index = randrange(len(tash_train_tokenized_dataset))
+        sample = tash_train_tokenized_dataset[index]
         detokenized = self.decode(sample["input_ids"])
         logger.info(
             f"Input sample {index} of the training set: {sample['input_ids']}")
@@ -414,4 +413,4 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             logger.info(
                 f"Label sample {index} of the training set (detokenized): {detokenized}")
 
-        return tokenized_dataset, eval_tokenized_dataset
+        return tash_train_tokenized_dataset, tash_eval_tokenized_dataset, apcd_train_tokenized_dataset, apcd_eval_tokenized_dataset

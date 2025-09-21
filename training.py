@@ -2,8 +2,8 @@
 # Portions of the original code have been modified to fit the specific requirements
 # of this project. Credit goes to the original authors for their contributions.
 
-from trainers import PoetryCVTrainer
-import wandb
+from trainers import PoetryArabicTrainer
+# import wandb
 from argparse import ArgumentParser
 
 from transformers.models.auto.modeling_auto import AutoModelForSeq2SeqLM
@@ -107,8 +107,22 @@ if __name__ == "__main__":
     )
 
     argument_parser.add_argument(
+        "--train_on",
+        default="tash",
+        help="which dataset to train on, `tash` for Tashkeela, APCD otherwise"
+    )
+
+    argument_parser.add_argument(
         "--description",
         help="description of the experiment",
+    )
+
+    # number of epochs
+    argument_parser.add_argument(
+        "--num_train_epochs",
+        default=3,
+        type=int,
+        help="number of epochs to train",
     )
 
     args = argument_parser.parse_args()
@@ -126,26 +140,27 @@ if __name__ == "__main__":
     for arg in vars(args):
         logger.info(f"  {arg}: {getattr(args, arg)}")
 
-    # Initialize wandb
-    wandb.login()
-    run = wandb.init(
-        # Set the project where this run will be logged
-        project="poetry_CV_training",
-        # Track hyperparameters and run metadata
-        config=args.__dict__,
-    )
+    # If you want to use wandb to track experiments, uncomment the following lines
+    # wandb.login()
+    # run = wandb.init(
+    #     # Set the project where this run will be logged
+    #     project="poetry_training_arabic",
+    #     # Track hyperparameters and run metadata
+    #     config=args.__dict__,
+    # )
 
     # Set up trainer
     Trainer = partial(
-        PoetryCVTrainer,
+        PoetryArabicTrainer,
         output_dir=join(args.out_dir, basename(args.model_name_or_path)),
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_acc_steps,
         gradient_checkpointing=False,
         test_run=args.debug,
-        model_type=args.type,
         multiple_words=args.multiple_words,
-        ablation=args.ablation
+        ablation=args.ablation,
+        train_on=args.train_on,
+        num_train_epochs=args.num_train_epochs,
     )
 
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path)
@@ -155,6 +170,8 @@ if __name__ == "__main__":
 
     # train
     trainer.train()
+    # trainer.train(
+    #     resume_from_checkpoint="tash_training_base/byt5-base/checkpoint-38912")
 
     # save model
     trainer.save_model()
@@ -162,4 +179,4 @@ if __name__ == "__main__":
     model = trainer.model
 
     # test
-    trainer.test()
+    # trainer.test()
